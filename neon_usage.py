@@ -8,10 +8,12 @@ costs based on Launch plan pricing.  Includes monthly forecasting.
 Usage:
     export NEON_API_KEY="your-api-key"
     export ORG_ID="org-your-org-id"       # optional, or use --org-id
-    python neon_usage.py [--org-id ORG] [--detail] [--granularity daily] [--json]
+    python neon_usage.py [--org-id ORG] [--detail] [--active-only] [--granularity daily] [--json]
 
 Credentials can also be placed in a .env file in the script's directory.
 Priority: CLI argument > environment variable > .env file.
+
+Vibe coded with Warp by Michał Suda <klumz33@michalsuda.net> 
 """
 
 import os
@@ -127,8 +129,12 @@ def get_api_key():
 def get_org_id(cli_value=None):
     """Resolve org_id: CLI arg > $ORG_ID env var > .env."""
     org_id = cli_value or os.environ.get("ORG_ID")
-    if org_id:
-        _validate_org_id(org_id)
+    if not org_id:
+        print("Error: ORG_ID is required for the v2 consumption API.")
+        print("Set it via --org-id, ORG_ID env variable, or .env file.")
+        print("Find your org ID at: https://console.neon.tech/app/settings")
+        sys.exit(1)
+    _validate_org_id(org_id)
     return org_id
 
 
@@ -160,7 +166,14 @@ def api_request(endpoint, api_key, params=None):
         elif code == 429:
             print("API Error (429): Rate limited. Please wait and try again.")
         else:
+            body = ""
+            try:
+                body = e.read().decode()
+            except Exception:
+                pass
             print(f"API Error ({code}): Request failed.")
+            if body:
+                print(f"Response: {body}")
         sys.exit(1)
     except URLError:
         print("Network Error: Unable to reach Neon API.")
@@ -275,6 +288,43 @@ def aggregate_all_projects(projects_data):
 # Cost calculation
 # ---------------------------------------------------------------------------
 
+def calculate_project_cost(proj_metrics, org_total_transfer_gb, org_transfer_cost):
+    """Calculate costs for a single project.
+
+    Compute, storage, and instant restore use straightforward per-unit pricing.
+    Data transfer cost is split proportionally: the 100 GB free tier is org-wide,
+    so each project's share of the overage cost equals its fraction of total
+    org transfer.
+    """
+    cu_hours = proj_metrics["compute_unit_seconds"] / 3600
+    compute_cost = cu_hours * PRICING["compute_per_cu_hour"]
+
+    storage_gb = bytes_to_gb(
+        proj_metrics["root_branch_bytes_month"]
+        + proj_metrics["child_branch_bytes_month"])
+    storage_cost = storage_gb * PRICING["storage_per_gb_month"]
+
+    ir_gb = bytes_to_gb(proj_metrics["instant_restore_bytes_month"])
+    ir_cost = ir_gb * PRICING["instant_restore_per_gb_month"]
+
+    transfer_gb = bytes_to_gb(
+        proj_metrics["public_network_transfer_bytes"]
+        + proj_metrics["private_network_transfer_bytes"])
+    if org_total_transfer_gb > 0 and org_transfer_cost > 0:
+        transfer_cost = (transfer_gb / org_total_transfer_gb) * org_transfer_cost
+    else:
+        transfer_cost = 0.0
+
+    total = compute_cost + storage_cost + ir_cost + transfer_cost
+    return {
+        "compute_cost": compute_cost,
+        "storage_cost": storage_cost,
+        "ir_cost": ir_cost,
+        "transfer_cost": transfer_cost,
+        "total": total,
+    }
+
+
 def calculate_costs(metrics, days_elapsed):
     """Calculate costs from aggregated v2 metrics."""
     costs = {}
@@ -345,34 +395,66 @@ def calculate_costs(metrics, days_elapsed):
     return costs
 
 
-def calculate_forecast(costs, days_elapsed, days_in_month):
-    """Forecast end-of-month costs based on current run rate."""
+def calculate_forecast(costs, days_elapsed, days_in_month, deleted_metrics=None):
+    """Forecast end-of-month costs based on current run rate.
+
+    If deleted_metrics is provided, deleted projects' cumulative costs
+    (compute, transfer) are fixed at their current value and their
+    point-in-time costs (storage, instant restore, branches) drop to 0.
+    """
     if days_elapsed == 0:
         return None
 
     ratio = days_elapsed / days_in_month
     forecast = {}
 
-    # Compute scales with time
+    # Pre-compute deleted portions (zero if no deleted projects)
+    if deleted_metrics:
+        del_cu_hours = deleted_metrics.get("compute_unit_seconds", 0) / 3600
+        del_compute_cost = del_cu_hours * PRICING["compute_per_cu_hour"]
+        del_storage_gb = bytes_to_gb(
+            deleted_metrics.get("root_branch_bytes_month", 0)
+            + deleted_metrics.get("child_branch_bytes_month", 0))
+        del_ir_gb = bytes_to_gb(
+            deleted_metrics.get("instant_restore_bytes_month", 0))
+        del_transfer_gb = bytes_to_gb(
+            deleted_metrics.get("public_network_transfer_bytes", 0)
+            + deleted_metrics.get("private_network_transfer_bytes", 0))
+        del_branch_hours = deleted_metrics.get("extra_branches_month", 0)
+        if days_elapsed > 0:
+            del_avg_branches = del_branch_hours / (24 * days_elapsed)
+        else:
+            del_avg_branches = 0
+    else:
+        del_cu_hours = del_compute_cost = 0
+        del_storage_gb = del_ir_gb = del_transfer_gb = 0
+        del_avg_branches = 0
+
+    # Compute: extrapolate active, fix deleted
+    active_cu = costs["compute"]["cu_hours"] - del_cu_hours
+    active_cc = costs["compute"]["cost"] - del_compute_cost
     forecast["compute"] = {
-        "cu_hours": costs["compute"]["cu_hours"] / ratio,
-        "cost": costs["compute"]["cost"] / ratio,
+        "cu_hours": active_cu / ratio + del_cu_hours,
+        "cost": active_cc / ratio + del_compute_cost,
     }
 
-    # Storage is point-in-time
+    # Storage: active stays (point-in-time), deleted drops to 0
+    active_storage = costs["storage"]["gb"] - del_storage_gb
     forecast["storage"] = {
-        "gb": costs["storage"]["gb"],
-        "cost": costs["storage"]["cost"],
+        "gb": active_storage,
+        "cost": active_storage * PRICING["storage_per_gb_month"],
     }
 
-    # Instant restore is point-in-time
+    # Instant restore: same as storage
+    active_ir = costs["instant_restore"]["gb"] - del_ir_gb
     forecast["instant_restore"] = {
-        "gb": costs["instant_restore"]["gb"],
-        "cost": costs["instant_restore"]["cost"],
+        "gb": active_ir,
+        "cost": active_ir * PRICING["instant_restore_per_gb_month"],
     }
 
-    # Transfer scales with time
-    proj_transfer = costs["data_transfer"]["gb"] / ratio
+    # Transfer: extrapolate active, fix deleted, then apply free tier
+    active_transfer = costs["data_transfer"]["gb"] - del_transfer_gb
+    proj_transfer = active_transfer / ratio + del_transfer_gb
     proj_billable = max(0, proj_transfer - PRICING["data_transfer_included_gb"])
     forecast["data_transfer"] = {
         "gb": proj_transfer,
@@ -380,10 +462,11 @@ def calculate_forecast(costs, days_elapsed, days_in_month):
         "cost": proj_billable * PRICING["data_transfer_per_gb"],
     }
 
-    # Extra branches stay constant
+    # Extra branches: active stays constant, deleted drop to 0
+    active_branches = costs["extra_branches"]["avg_count"] - del_avg_branches
     forecast["extra_branches"] = {
-        "avg_count": costs["extra_branches"]["avg_count"],
-        "cost": costs["extra_branches"]["cost"],
+        "avg_count": active_branches,
+        "cost": active_branches * PRICING["extra_branch_per_month"],
     }
 
     subtotal = sum(forecast[k]["cost"] for k in
@@ -414,11 +497,14 @@ def separator(char="-", length=64):
     print(char * length)
 
 
-def print_project_summary(per_project, name_map, detail):
-    """Print per-project usage table."""
+def print_project_summary(per_project, name_map, detail, costs):
+    """Print per-project usage table with dollar costs."""
     separator()
     print("\nPER-PROJECT USAGE")
     separator()
+
+    org_total_transfer_gb = costs["data_transfer"]["gb"]
+    org_transfer_cost = costs["data_transfer"]["cost"]
 
     for proj in per_project:
         pid = proj["project_id"]
@@ -437,22 +523,36 @@ def print_project_summary(per_project, name_map, detail):
         if cu_hours == 0 and storage_gb == 0 and transfer_gb == 0 and ir_gb == 0:
             continue
 
-        print(f"\n{name} ({pid[:12]}...)")
-        print(f"  Compute:         {fmt_num(cu_hours)} CU-hours")
+        pc = calculate_project_cost(m, org_total_transfer_gb, org_transfer_cost)
+
+        # Use fixed-width value+unit column so "cost:" aligns
+        VU_W = 16  # width for the value+unit field
+
+        deleted_tag = " [deleted]" if proj.get("deleted") else ""
+        print(f"\n{name} ({pid[:12]}...){deleted_tag}")
+        vu = f"{fmt_num(cu_hours)} CU-hours"
+        print(f"  Compute:         {vu:<{VU_W}}cost: {fmt_currency(pc['compute_cost'])}")
 
         if detail:
             print(f"  Root Storage:    {fmt_num(bytes_to_gb(m['root_branch_bytes_month']))} GB")
             print(f"  Child Storage:   {fmt_num(bytes_to_gb(m['child_branch_bytes_month']))} GB")
+            print(f"  Storage cost:    {fmt_currency(pc['storage_cost'])}")
         else:
-            print(f"  Storage:         {fmt_num(storage_gb)} GB")
+            vu = f"{fmt_num(storage_gb)} GB"
+            print(f"  Storage:         {vu:<{VU_W}}cost: {fmt_currency(pc['storage_cost'])}")
 
-        print(f"  Instant Restore: {fmt_num(ir_gb)} GB")
+        vu = f"{fmt_num(ir_gb)} GB"
+        print(f"  Instant Restore: {vu:<{VU_W}}cost: {fmt_currency(pc['ir_cost'])}")
 
         if detail:
             print(f"  Public Transfer: {fmt_num(bytes_to_gb(m['public_network_transfer_bytes']))} GB")
             print(f"  Private Transfer:{fmt_num(bytes_to_gb(m['private_network_transfer_bytes']))} GB")
+            print(f"  Transfer cost:   {fmt_currency(pc['transfer_cost'])}")
         else:
-            print(f"  Transfer:        {fmt_num(transfer_gb)} GB")
+            vu = f"{fmt_num(transfer_gb)} GB"
+            print(f"  Transfer:        {vu:<{VU_W}}cost: {fmt_currency(pc['transfer_cost'])}")
+
+        print(f"  {name} total cost: {fmt_currency(pc['total'])}")
 
 
 def print_current_usage(costs, detail):
@@ -551,6 +651,11 @@ def main():
         help="Metric granularity (default: daily)",
     )
     parser.add_argument(
+        "--active-only",
+        action="store_true",
+        help="Exclude deleted projects (default: include them with costs)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Output results as JSON",
@@ -582,7 +687,7 @@ def main():
         print("\nFetching projects...")
     name_map = get_project_names(api_key, org_id)
     if not args.json:
-        print(f"Found {len(name_map)} projects")
+        print(f"Found {len(name_map)} active projects")
 
     # Fetch v2 consumption data
     if not args.json:
@@ -596,10 +701,39 @@ def main():
 
     # Aggregate
     per_project, totals = aggregate_all_projects(projects_data)
+
+    # Tag deleted projects (in consumption but not in /projects)
+    for p in per_project:
+        p["deleted"] = p["project_id"] not in name_map
+
+    if args.active_only:
+        per_project = [p for p in per_project if not p["deleted"]]
+        totals = {m: 0 for m in V2_METRICS}
+        for p in per_project:
+            for name in V2_METRICS:
+                totals[name] += p["metrics"][name]
+
+    # Compute deleted totals for forecast adjustment
+    deleted_totals = None
+    if not args.active_only:
+        dt = {m: 0 for m in V2_METRICS}
+        has_deleted = False
+        for p in per_project:
+            if p["deleted"]:
+                has_deleted = True
+                for name in V2_METRICS:
+                    dt[name] += p["metrics"][name]
+        if has_deleted:
+            deleted_totals = dt
+
     costs = calculate_costs(totals, days_elapsed)
-    forecast = calculate_forecast(costs, days_elapsed, days_in_month)
+    forecast = calculate_forecast(costs, days_elapsed, days_in_month,
+                                  deleted_totals)
 
     # JSON output
+    org_total_transfer_gb = costs["data_transfer"]["gb"]
+    org_transfer_cost = costs["data_transfer"]["cost"]
+
     if args.json:
         output = {
             "report_date": now.isoformat(),
@@ -616,6 +750,10 @@ def main():
                     "name": name_map.get(p["project_id"],
                                          p["project_id"]),
                     "metrics": p["metrics"],
+                    "deleted": p.get("deleted", False),
+                    "costs": calculate_project_cost(
+                        p["metrics"], org_total_transfer_gb,
+                        org_transfer_cost),
                 }
                 for p in per_project
             ],
@@ -628,9 +766,17 @@ def main():
         return
 
     # Text output
-    print(f"Processing {len(per_project)} projects...")
+    n_deleted = sum(1 for p in per_project if p.get("deleted"))
+    n_active = len(per_project) - n_deleted
+    if n_deleted > 0:
+        print(f"Processing {n_active} active + {n_deleted} deleted projects...")
+    elif len(per_project) != len(name_map):
+        print(f"Processing {len(per_project)} consumption entries "
+              f"({len(name_map)} active projects)...")
+    else:
+        print(f"Processing {len(per_project)} projects...")
 
-    print_project_summary(per_project, name_map, args.detail)
+    print_project_summary(per_project, name_map, args.detail, costs)
     print_current_usage(costs, args.detail)
     print_forecast(forecast)
 
